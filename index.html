@@ -126,6 +126,12 @@
       <div class="tip" id="tip"></div>
       <div class="empty" id="empty" style="display:none"></div>
     </div>
+    <div class="note" style="margin-top:10px">
+      이 기기에서 1분마다 모은 기록은 이 브라우저에만 있어요. 다른 기기에서도 보이게 하려면
+      <button id="exportLocal" style="padding:3px 10px;font-size:12px">이 기기 기록 내보내기</button>
+      를 눌러 받은 파일을 공유 기록에 합치면 돼요.
+      <span id="exportMsg"></span>
+    </div>
   </section>
 
   <div class="list" id="list"></div>
@@ -246,6 +252,27 @@ function seriesFor(k) {
 }
 
 const coverage = () => mergeCoverage(sharedCoverage, local.coverage);
+
+// Download this browser's readings (plus the older page's "starDash.snapshots.v1" ones,
+// which had no coverage list - each reading counts as one check) in the shared format,
+// ready for scripts/merge_history.py.
+function exportLocal() {
+  const legacy = load("starDash.snapshots.v1", {});
+  const repos = {}, cov = local.coverage.map(c => c.slice());
+  for (const [k, pts] of Object.entries(local.repos)) repos[k] = pts.map(p => p.slice());
+  for (const [k, pts] of Object.entries(legacy)) {
+    (repos[k] = repos[k] || []).push(...pts);
+    for (const p of pts) cov.push([p[0], p[0]]);
+  }
+  const n = Object.values(repos).reduce((s, a) => s + a.length, 0);
+  if (!n) { $("exportMsg").textContent = "이 브라우저에는 내보낼 기록이 없어요."; return; }
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify({ repos, coverage: cov })], { type: "application/json" }));
+  a.download = `star-history-${location.protocol === "file:" ? "local" : "site"}-${stamp}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  $("exportMsg").textContent = `✓ 기록 ${n}개를 ${a.download} 파일로 받았어요.`;
+}
 
 // Stars gained in the last 24h: now minus the value 24h ago (or the first record if newer).
 function gained24h(k) {
@@ -484,6 +511,7 @@ function schedule() {
 }
 
 $("refresh").addEventListener("click", refresh);
+$("exportLocal").addEventListener("click", exportLocal);
 $("interval").addEventListener("change", schedule);
 $("legend").addEventListener("click", e => { const b = e.target.closest(".chip"); if (b) toggleHighlight(b.dataset.k); });
 $("ranges").addEventListener("click", e => {
