@@ -138,14 +138,19 @@ let REPOS = [];                            // loaded from repos.json
 const KEY = r => r.repo.toLowerCase();
 const SLOTS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"];
 const MAX_HIGHLIGHT = SLOTS.length;
-const LS = { hl: "starDash.highlight.v1" };
+const LS = { hl: "starDash.highlight.v1", local: "starDash.local.v2" };
+const GAP = 5 * 60000;                     // checks closer than this count as continuous recording
+const LOCAL_KEEP = 8 * 86400000;           // keep this browser's own readings for 8 days
 
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
 const last = {};                           // stars at previous refresh
 let shared = {};                           // { key: [[ms, stars], ...] } recorded by GitHub Actions
+let sharedCoverage = [];                   // [[from, to], ...] when GitHub Actions was recording
 let sharedUpdated = null;                  // time of the newest recorded point
+// Readings this browser takes every minute while the page is open (same shape as shared).
+let local = load(LS.local, { repos: {}, coverage: [] });
 let highlight = load(LS.hl, null);         // { key: slotIndex } - color follows the repo, not its rank
 let current = {};                          // latest { key: stars }
 let range = 0;                             // 0 = all
@@ -187,17 +192,60 @@ async function loadShared() {
     if (!res.ok) return;
     const data = await res.json();
     shared = data.repos || {};
-    sharedUpdated = Math.max(0, ...Object.values(shared).flat().map(p => p[0])) || null;
+    sharedCoverage = data.coverage || [];
+    sharedUpdated = Math.max(0, ...sharedCoverage.map(c => c[1]), ...Object.values(shared).flat().map(p => p[0])) || null;
   } catch { /* keep the last copy */ }
 }
 
-// Step series for one repo: recorded points, plus the live value right now.
-function seriesFor(k) {
-  const pts = (shared[k] || []).slice();
-  const v = current[k];
-  if (v != null && (!pts.length || pts[pts.length - 1][1] !== v)) pts.push([Date.now(), v]);
-  return pts.sort((a, b) => a[0] - b[0]);
+// Extend the last coverage interval if this check follows it closely, else start a new one.
+function addCoverage(list, t) {
+  const lastI = list[list.length - 1];
+  if (lastI && t >= lastI[0] && t - lastI[1] <= GAP) lastI[1] = Math.max(lastI[1], t);
+  else list.push([t, t]);
 }
+
+// Union of coverage intervals; intervals within GAP of each other are joined.
+function mergeCoverage(...lists) {
+  const all = lists.flat().map(c => c.slice()).sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const c of all) {
+    const lastI = out[out.length - 1];
+    if (lastI && c[0] - lastI[1] <= GAP) lastI[1] = Math.max(lastI[1], c[1]);
+    else out.push(c);
+  }
+  return out;
+}
+
+// Store this check: a point when a repo's count changed, and coverage for "someone was recording".
+function recordLocal(map, now) {
+  for (const r of REPOS) {
+    const k = KEY(r), v = map[k];
+    if (v == null) continue;
+    const arr = local.repos[k] || (local.repos[k] = []);
+    if (!arr.length || arr[arr.length - 1][1] !== v) arr.push([now, v]);
+  }
+  addCoverage(local.coverage, now);
+  // drop old local readings (the shared history has them by then)
+  const cutoff = now - LOCAL_KEEP;
+  for (const k in local.repos) {
+    const arr = local.repos[k];
+    while (arr.length > 1 && arr[1][0] < cutoff) arr.shift();
+  }
+  local.coverage = local.coverage.filter(c => c[1] >= cutoff);
+  save(LS.local, local);
+}
+
+// Step series for one repo: GitHub Actions records + this browser's readings + the live value.
+function seriesFor(k) {
+  const pts = [...(shared[k] || []), ...(local.repos[k] || [])].sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const p of pts) if (!out.length || out[out.length - 1][1] !== p[1]) out.push(p);
+  const v = current[k];
+  if (v != null && (!out.length || out[out.length - 1][1] !== v)) out.push([Date.now(), v]);
+  return out;
+}
+
+const coverage = () => mergeCoverage(sharedCoverage, local.coverage);
 
 // Stars gained in the last 24h: now minus the value 24h ago (or the first record if newer).
 function gained24h(k) {
@@ -238,8 +286,9 @@ function drawChart() {
   const now = Date.now();
   const all = REPOS.map(r => ({ r, k: KEY(r), pts: seriesFor(KEY(r)) })).filter(s => s.pts.length);
 
-  $("sourceNote").textContent = "GitHub Actions가 약 10분마다 기록한 값이에요. 대시보드를 닫아도 기록은 계속되고, 어느 기기에서 열어도 같은 기록이 보여요." +
-    (sharedUpdated ? " (마지막 변화 기록: " + fmtFull(sharedUpdated) + ")" : " 아직 기록이 없어요. 첫 기록이 쌓일 때까지 잠시 기다려 주세요.") +
+  $("sourceNote").textContent = "이 페이지를 열어둔 동안에는 이 브라우저가 1분마다 직접 확인하고, 닫혀 있는 동안에는 GitHub Actions가 2분마다 기록해요 (사이트 반영은 최대 10분 지연)." +
+    " 점선은 아무도 기록하지 않아 그 사이 변화를 모르는 구간이에요." +
+    (sharedUpdated ? " (GitHub 마지막 기록: " + fmtFull(sharedUpdated) + ")" : "") +
     " 위 칩을 누르면 강조할 팀을 바꿀 수 있어요 (최대 8팀).";
 
   const minT = all.length ? Math.min(...all.map(s => s.pts[0][0])) : now;
@@ -288,11 +337,22 @@ function drawChart() {
     return d;
   };
 
+  // Solid only where someone was recording; elsewhere the dashed underlay shows through,
+  // so a flat stretch with no data isn't mistaken for "no change".
+  const cov = coverage().filter(c => c[1] >= x0);
+  g += `<defs><clipPath id="covClip">` +
+       cov.map(c => { const a = Math.max(X(c[0]), m.l) - 2, b = Math.min(X(c[1]), W - m.r) + 2;
+                      return `<rect x="${a}" y="0" width="${Math.max(0, b - a)}" height="${H}"/>`; }).join("") +
+       `</clipPath></defs>`;
+  const line = (d, color, width) =>
+    `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width}" stroke-dasharray="3 4" opacity=".6"/>` +
+    `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width}" stroke-linejoin="round" clip-path="url(#covClip)"/>`;
+
   // muted repos first, highlighted on top
   const muted = all.filter(s => highlight[s.k] == null), hot = all.filter(s => highlight[s.k] != null);
-  for (const s of muted) g += `<path d="${path(s.pts)}" fill="none" stroke="var(--faint)" stroke-width="1.5"/>`;
+  for (const s of muted) g += line(path(s.pts), "var(--faint)", 1.5);
   for (const s of hot) {
-    g += `<path d="${path(s.pts)}" fill="none" stroke="${colorOf(s.k)}" stroke-width="2" stroke-linejoin="round"/>`;
+    g += line(path(s.pts), colorOf(s.k), 2);
     const v = s.pts[s.pts.length - 1][1];
     g += `<circle cx="${X(x1)}" cy="${Y(v)}" r="4" fill="${colorOf(s.k)}" stroke="var(--card)" stroke-width="2"/>`;
   }
@@ -404,6 +464,7 @@ async function refresh() {
     const [live] = await Promise.all([fetchStars(), loadShared()]);
     current = live;
     const now = Date.now();
+    recordLocal(current, now);
     render(current);
     renderLegend();
     drawChart();

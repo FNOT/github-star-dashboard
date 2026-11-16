@@ -14,6 +14,7 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPOS_FILE = os.path.join(ROOT, "repos.json")
 HISTORY_FILE = os.path.join(ROOT, "data", "history.json")
+GAP_MS = 5 * 60 * 1000  # must match GAP in index.html
 
 
 def fetch_stars(repos):
@@ -51,14 +52,19 @@ def main():
             points.append([now, value])
             changed.append(f"{r['repo']}={value}")
 
-    if changed:
-        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, separators=(",", ":"))
-            f.write("\n")
-        print("changed: " + ", ".join(changed))
+    # Coverage = when someone was recording, so the dashboard can tell "no change"
+    # apart from "nobody checked". Checks within GAP of each other extend one interval.
+    coverage = history.setdefault("coverage", [])
+    if coverage and now >= coverage[-1][0] and now - coverage[-1][1] <= GAP_MS:
+        coverage[-1][1] = max(coverage[-1][1], now)
     else:
-        print("no change")
+        coverage.append([now, now])
+
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, separators=(",", ":"))
+        f.write("\n")
+    print("changed: " + ", ".join(changed) if changed else "no change")
 
 
 if __name__ == "__main__":
