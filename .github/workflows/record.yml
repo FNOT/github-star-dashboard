@@ -1,12 +1,18 @@
 name: Record stars
 
+# GitHub's cron schedule is best-effort and often skips runs, so instead of relying on
+# it, each run records every 2 minutes for ~55 minutes and then starts the next run
+# itself. The hourly cron is only a backup that restarts the chain if it ever breaks.
+# Changes are pushed at most every 10 minutes to stay under the GitHub Pages build limit.
+
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes (GitHub may delay scheduled runs)
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: record-stars
@@ -15,6 +21,7 @@ concurrency:
 jobs:
   record:
     runs-on: ubuntu-latest
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
 
@@ -22,20 +29,48 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Record star counts
+      - name: Record every 2 minutes for ~55 minutes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/record.py
-
-      - name: Commit if changed
         run: |
-          if [ -z "$(git status --porcelain -- data)" ]; then
-            echo "No changes"
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/history.json
-          git commit -m "Record stars $(date -u +%Y-%m-%dT%H:%MZ)"
-          git pull --rebase
-          git push
+
+          # Merge our points onto the latest remote history instead of rebasing,
+          # so a concurrent change to history.json never causes a conflict.
+          push_changes() {
+            git diff --quiet -- data/history.json && return 0
+            cp data/history.json "$RUNNER_TEMP/mine.json"
+            for attempt in 1 2 3; do
+              git fetch -q origin main && git reset -q --hard origin/main
+              python scripts/merge_history.py data/history.json "$RUNNER_TEMP/mine.json"
+              git diff --quiet -- data/history.json && return 0
+              git add data/history.json
+              git commit -q -m "Record stars $(date -u +%Y-%m-%dT%H:%MZ)"
+              git push -q origin HEAD:main && return 0
+              sleep 5
+            done
+            echo "push failed; keeping points for the next attempt"
+            cp "$RUNNER_TEMP/mine.json" data/history.json
+          }
+
+          end=$((SECONDS + 55 * 60))
+          last_push=$SECONDS
+          while [ $SECONDS -lt $end ]; do
+            python scripts/record.py || echo "record failed, will retry"
+            if [ $((SECONDS - last_push)) -ge 600 ]; then
+              push_changes
+              last_push=$SECONDS
+            fi
+            sleep 120
+          done
+          python scripts/record.py || true
+          push_changes
+
+      # Not on cancel: cancelling a run in the Actions tab stops the chain
+      # (the hourly cron will start it again unless the workflow is disabled).
+      - name: Start the next run
+        if: success() || failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run record.yml --ref "${{ github.ref_name }}"
